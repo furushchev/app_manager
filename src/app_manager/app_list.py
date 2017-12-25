@@ -42,10 +42,12 @@ currently installed applications.
 import os
 import sys
 import yaml
+import rospy
+
 
 from .app import load_AppDefinition_by_name
 from .msg import App, ClientApp, KeyValue, Icon
-from .exceptions import AppException, InvalidAppException
+from .exceptions import AppException, InvalidAppException, NotFoundException
 
 def get_default_applist_directory():
     """
@@ -108,7 +110,13 @@ class InstalledFile(object):
                 for areqd in ['app']:
                     if not areqd in app:
                         raise InvalidAppException("installed file [%s] app definition is missing required key [%s]"%(self.filename, areqd))
-                available_apps.append(load_AppDefinition_by_name(app['app']))
+                try:
+                    available_apps.append(load_AppDefinition_by_name(app['app']))
+                except NotFoundException as e:
+                    rospy.logerr(e)
+                    continue
+                except Exception as e:
+                    raise e
                 
         self.available_apps = available_apps
 
