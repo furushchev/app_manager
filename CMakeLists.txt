@@ -1,11 +1,17 @@
 cmake_minimum_required(VERSION 2.8.3)
 project(app_manager)
-find_package(catkin REQUIRED COMPONENTS message_runtime std_msgs rospy roslaunch rosgraph rosunit message_generation)
+find_package(catkin REQUIRED COMPONENTS
+  message_generation
+  message_runtime
+  rosgraph
+  roslaunch
+  rospy
+  rosunit
+  std_msgs
+  )
 
-catkin_add_nosetests(test/test_app.py)
-catkin_add_nosetests(test/test_app_list.py)
 add_message_files(
-    FILES 
+    FILES
     AppList.msg
     ClientApp.msg
     AppInstallationState.msg
@@ -17,7 +23,7 @@ add_message_files(
     StatusCodes.msg
 )
 add_service_files(
-    FILES 
+    FILES
     GetAppDetails.srv
     ListApps.srv
     UninstallApp.srv
@@ -29,7 +35,7 @@ add_service_files(
 
 
 generate_messages(
-    DEPENDENCIES std_msgs 
+    DEPENDENCIES std_msgs
 )
 
 catkin_package(
@@ -40,10 +46,13 @@ catkin_package(
 )
 
 
-install(PROGRAMS scripts/app_manager scripts/rosget scripts/test_app.py bin/appmaster
+install(PROGRAMS bin/rosget
  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
-install(DIRECTORY msg msg_gen scripts src srv srv_gen test
- DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})
+install(DIRECTORY scripts test
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
+  USE_SOURCE_PERMISSIONS)
 
-
-
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test/test_app.py)
+  catkin_add_nosetests(test/test_app_list.py)
+endif()
