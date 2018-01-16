@@ -51,13 +51,16 @@ from .srv import StartApp, StopApp, ListApps, ListAppsResponse, StartAppResponse
 
 class AppManager(object):
 
-    def __init__(self, robot_name, interface_master, app_list, exchange):
+    def __init__(self, robot_name, interface_master, app_list, exchange, is_exclusive):
         self._robot_name = robot_name
         self._interface_master = interface_master
         self._app_list = app_list
-        self._current_app = self._current_app_definition = None
+        self._current_apps = dict()
+        self._current_app_definitions = dict()
+        self._launches = dict()
+        self._interface_syncs = dict()
         self._exchange = exchange
-            
+        self._is_exclusive = is_exclusive
         rospy.loginfo("Starting app manager for %s"%self._robot_name)
 
         self._app_interface = self.scoped_name('application')
@@ -90,9 +93,6 @@ class AppManager(object):
                                     local_service_names=service_names,
                                     local_pub_names=pub_names)
 
-        self._launch = None
-        self._interface_sync = None
-
         roslaunch.pmon._init_signal_handlers()
 
         if (self._exchange):
@@ -105,23 +105,33 @@ class AppManager(object):
     def shutdown(self):
         if self._api_sync:
             self._api_sync.stop()
-        if self._launch:
-            self._launch.shutdown()
-            self._interface_sync.stop()
+        try:
+            self.stop_all_apps()
+        except:
+            pass
 
-    def _get_current_app(self):
-        return self._current_app
+    def _get_current_apps(self):
+        return self._current_apps.values()
 
-    def _set_current_app(self, app, app_definition):
-        self._current_app = app
-        self._current_app_definition = app_definition
-        
-        if self._list_apps_pub:
-            if app is not None:
-                self._list_apps_pub.publish([app], self._app_list.get_app_list())
-            else:
-                self._list_apps_pub.publish([], self._app_list.get_app_list())
-    
+    def _set_current_apps(self, apps, app_definitions):
+        if self._is_exclusive and len(apps) > 1:
+            raise RuntimeError("Current app could not be more than 2")
+        self._current_apps = {app.name: app for app in apps}
+        self._current_app_definitions = {d.name: d for d in app_definitions}
+        self.publish_list_apps()
+
+    def _add_current_app(self, app, app_definition):
+        if self._is_exclusive and len(self._get_current_apps()) >= 1:
+            raise RuntimeError("Current app could not be more than 2")
+        self._current_apps[app.name] = app
+        self._current_app_definitions[app_definition.name] = app_definition
+        self.publish_list_apps()
+
+    def _remove_current_app(self, app, app_definition):
+        self._current_apps.pop(app.name)
+        self._current_app_definitions.pop(app_definition.name)
+        self.publish_list_apps()
+
     def scoped_name(self, name):
         return rosgraph.names.canonicalize_name('/%s/%s'%(self._robot_name, rospy.remap_name(name)))
 
@@ -140,10 +150,7 @@ class AppManager(object):
         return GetInstallationStateResponse(installed_apps=i_apps, available_apps=a_apps)
 
     def publish_list_apps(self):
-        if self._current_app:
-            self._list_apps_pub.publish([self._current_app], self._app_list.get_app_list())
-        else:
-            self._list_apps_pub.publish([], self._app_list.get_app_list())
+        self._list_apps_pub.publish(self._get_current_apps(), self._app_list.get_app_list())
 
     def publish_exchange_list_apps(self):
         if (self._exchange == None):
@@ -173,28 +180,22 @@ class AppManager(object):
             return UninstallAppResponse(uninstalled=False, message="app [%s] could not be uninstalled"%(appname))
 
     def handle_list_apps(self, req):
-        rospy.loginfo("Listing apps")
-        current = self._current_app
-        if current:
-            running_apps = [current]
-        else:
-            running_apps = []
         self._app_list.update()
-        rospy.loginfo("done listing apps")
-        return ListAppsResponse(running_apps=running_apps, available_apps=self._app_list.get_app_list())
+        return ListAppsResponse(running_apps=self._get_current_apps(), available_apps=self._app_list.get_app_list())
 
     def handle_start_app(self, req):
-        rospy.loginfo("start_app: %s"%(req.name))
-        if self._current_app:
-            if self._current_app_definition.name == req.name:
-                return StartAppResponse(started=True, message="app [%s] already started"%(req.name), namespace=self._app_interface)
+        appname = req.name
+        rospy.loginfo("start_app: %s"%(appname))
+        if self._get_current_apps():
+            if appname in self._current_app_definitions.keys():
+                return StartAppResponse(
+                    started=True, message="app [%s] already started"%(appname), namespace=self._app_interface)
             else:
-                self.stop_app(self._current_app_definition.name)
-            #return StartAppResponse(started=False, message="Please stop the running app before starting another app.", error_code=StatusCodes.MULTIAPP_NOT_SUPPORTED)
-
+                # stop current running apps if exclusive mode
+                if self._is_exclusive:
+                    self.stop_all_apps()
         # TODO: the app list has already loaded the App data.  We should use that instead for consistency
 
-        appname = req.name
         rospy.loginfo("Loading app: %s"%(appname))
         try:
             app = load_AppDefinition_by_name(appname)
@@ -206,91 +207,107 @@ class AppManager(object):
             return StartAppResponse(started=False, message=str(e), error_code=StatusCodes.NOT_FOUND)
 
         try:
-            self._set_current_app(App(name=appname), app)
+            self._add_current_app(App(name=appname), app)
 
             rospy.loginfo("Launching: %s"%(app.launch))
             self._status_pub.publish(AppStatus(AppStatus.INFO, 'launching %s'%(app.display_name)))
 
             #TODO:XXX This is a roslaunch-caller-like abomination.  Should leverage a true roslaunch API when it exists.
-            self._launch = roslaunch.parent.ROSLaunchParent(rospy.get_param("/run_id"),
-                                                            [app.launch], is_core=False,
-                                                            process_listeners=())
-            self._launch._load_config()
+            launch = roslaunch.parent.ROSLaunchParent(rospy.get_param("/run_id"),
+                                                      [app.launch], is_core=False,
+                                                      process_listeners=())
+            launch._load_config()
 
             #TODO: convert to method
-            for N in self._launch.config.nodes:
+            for N in launch.config.nodes:
                 for t in app.interface.published_topics.keys():
                     N.remap_args.append((t, self._app_interface + '/' + t))
                 for t in app.interface.subscribed_topics.keys():
                     N.remap_args.append((t, self._app_interface + '/' + t))
-            self._launch.start()
+            launch.start()
+            self._launches[appname] = launch
 
             fp = [self._app_interface + '/' + x for x in app.interface.subscribed_topics.keys()]
             lp = [self._app_interface + '/' + x for x in app.interface.published_topics.keys()]
 
-            self._interface_sync = MasterSync(self._interface_master, foreign_pub_names=fp, local_pub_names=lp)
+            self._interface_syncs[appname] = MasterSync(self._interface_master, foreign_pub_names=fp, local_pub_names=lp)
 
-            thread.start_new_thread(self.app_monitor,())
+            thread.start_new_thread(self.app_monitor, (appname,))
 
-            return StartAppResponse(started=True, message="app [%s] started"%(appname), namespace=self._app_interface)
-        
+            return StartAppResponse(
+                started=True, message="app [%s] started"%(appname), namespace=self._app_interface)
+
         except Exception as e:
             try:
                 # attempt to kill any launched resources
-                self._stop_current()
+                self.stop_app(appname)
             except:
                 pass
             self._status_pub.publish(AppStatus(AppStatus.INFO, 'app start failed'))
             rospy.logerr("app start failed")
-            return StartAppResponse(started=False, message="internal error [%s]"%(str(e)), error_code=StatusCodes.INTERNAL_ERROR)
-    
-    def _stop_current(self):
-        try:
-            self._launch.shutdown()
-        finally:
-            self._launch = None
-        try:
-            self._interface_sync.stop()
-        finally:
-            self._interface_sync = None
+            import traceback
+            traceback.print_exc()
+            return StartAppResponse(
+                started=False, message="internal error [%s]"%(str(e)), error_code=StatusCodes.INTERNAL_ERROR)
 
     def handle_stop_app(self, req):
         rospy.loginfo("handle stop app: %s"%(req.name))
         return self.stop_app(req.name)
 
-    def app_monitor(self):
-        while self._launch:
+    def app_monitor(self, appname):
+        while appname in self._launches:
+            launch = self._launches[appname]
             time.sleep(0.1)
-            launch = self._launch
-            if launch:
-                pm = launch.pm
-                if pm:
-                    if pm.done:
-                        time.sleep(1.0)
-                        self.stop_app(self._current_app_definition.name)
-                        break
+            if launch.pm:
+                if launch.pm.done:
+                    time.sleep(1.0)
+                    self.stop_app(appname)
+                    break
 
-
+    def stop_all_apps(self):
+        failed_apps = []
+        for d in self._current_app_definitions.values():
+            r = self.stop_app(d.name)
+            if not r.stopped:
+                failed_apps.append(d)
+        resp = StopAppResponse()
+        if failed_apps:
+            resp.stopped = False
+            resp.error_code = StatusCodes.INTERNAL_ERROR
+            resp.message = 'Failed to stop apps %s' % failed_apps
+        else:
+            resp.stopped = True
+        return resp
 
     def stop_app(self, appname):
         resp = StopAppResponse(stopped=False)
-        try:
-            app = self._current_app_definition
 
+        if appname == '*':
             # request to stop all apps.
-            if app is not None and appname == '*':
-                appname = app.name
+            return self.stop_all_apps()
 
-            if app is None or app.name != appname:
+        try:
+            if appname not in self._current_app_definitions:
                 rospy.loginfo("handle stop app: app [%s] is not running [x]"%(appname))
                 resp.error_code = StatusCodes.NOT_RUNNING
-                resp.message = "app %s is not running"%(appname)                    
+                resp.message = "app %s is not running"%(appname)
             else:
+                app = self._current_apps[appname]
+                app_definition = self._current_app_definitions[appname]
                 try:
-                    if self._launch:
+                    if appname in self._launches:
                         rospy.loginfo("handle stop app: stopping app [%s]"%(appname))
-                        self._status_pub.publish(AppStatus(AppStatus.INFO, 'stopping %s'%(app.display_name)))
-                        self._stop_current()
+                        self._status_pub.publish(AppStatus(AppStatus.INFO, 'stopping %s'%(app_definition.display_name)))
+                        try:
+                            launch = self._launches.pop(appname)
+                            launch.shutdown()
+                        except Exception as e:
+                            rospy.logerr("Failed to stop app %s: %s" % (appname, str(e)))
+                        try:
+                            sync = self._interface_syncs.pop(appname)
+                            sync.stop()
+                        except Exception as e:
+                            rospy.logerr("Failed to stop app %s: %s" % (appname, str(e)))
                         rospy.loginfo("handle stop app: app [%s] stopped"%(appname))
                         resp.stopped = True
                         resp.message = "%s stopped"%(appname)
@@ -298,13 +315,14 @@ class AppManager(object):
                         rospy.loginfo("handle stop app: app [%s] is not running"%(appname))
                         resp.message = "app [%s] is not running"%(appname)
                         resp.error_code = StatusCodes.NOT_RUNNING
-                finally:
-                    self._launch = None
-                    self._set_current_app(None, None)
+                except Exception as e:
+                    rospy.logerr("Failed on stop app process: %s" % str(e))
+
+                self._remove_current_app(app, app_definition)
 
         except Exception as e:
             rospy.logerr("handle stop app: internal error %s"%(e))
             resp.error_code = StatusCodes.INTERNAL_ERROR
             resp.message = "internal error: %s"%(str(e))
-            
-        return resp 
+
+        return resp
