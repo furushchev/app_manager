@@ -11,6 +11,7 @@
 
   <author>Jeremy Leibs</author>
   <author>Ken Conley</author>
+  <author>Yuki Furuta</author>
 
   <buildtool_depend>catkin</buildtool_depend>
 
