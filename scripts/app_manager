@@ -70,7 +70,9 @@ def main():
             print >> sys.stderr, "Failed to load exchange: %s"%(str(e))
             sys.exit(1)
 
-    am = app_manager.AppManager(robot_name, interface_master, app_list, exchange)
+    # if exclusive is disabled, multiple applications can be run concurrently.
+    exclusive = rospy.get_param("~exclusive", True)
+    am = app_manager.AppManager(robot_name, interface_master, app_list, exchange, exclusive)
 
     rospy.on_shutdown(am.shutdown)
 
